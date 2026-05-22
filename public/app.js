@@ -427,28 +427,35 @@ function distanceToCorridor(userLat, userLon, corridor) {
 /* =====================================================
    NOTIFICATION MODULE
    ===================================================== */
+const NOTIF_SUPPORTED   = 'Notification' in window;
 const COOLDOWN_MS       = 5 * 60 * 1000;  // 5 dakika — aynı uyarı tekrar etmez
 const RADAR_WARN_M      = 500;             // metre — radara bu kadar yaklaşınca uyar
 const CORRIDOR_ENTER_M  = 80;              // metre — koridora bu kadar yakınınca uyar
 const CORRIDOR_EXIT_M   = 200;             // koridordan bu kadar uzaklaşınca çıktı say
 
+
 function updateNotifBadge() {
+  if (!NOTIF_SUPPORTED) {
+    // Bildirim desteklenmiyor (iOS Safari vs.) — badge gizle
+    els.notifBadge.classList.add('hidden');
+    return;
+  }
   const perm = Notification.permission;
   els.notifBadge.className = 'notif-badge ' + perm;
   if (perm === 'granted') {
-    els.notifBadgeIcon.textContent = '🔔';
+    els.notifBadgeIcon.textContent = '\uD83D\uDD14';
     els.notifBadge.title = 'Bildirimler açık';
   } else if (perm === 'denied') {
-    els.notifBadgeIcon.textContent = '🔕';
+    els.notifBadgeIcon.textContent = '\uD83D\uDD15';
     els.notifBadge.title = 'Bildirimler kapalı — ekran uyarısı kullanılıyor';
   } else {
-    els.notifBadgeIcon.textContent = '🔔';
+    els.notifBadgeIcon.textContent = '\uD83D\uDD14';
     els.notifBadge.title = 'Bildirim izni bekleniyor';
   }
 }
 
 async function requestNotificationPermission() {
-  if (!('Notification' in window)) return;
+  if (!NOTIF_SUPPORTED) return;
   if (Notification.permission === 'default') {
     await Notification.requestPermission();
   }
@@ -463,11 +470,10 @@ async function requestNotificationPermission() {
 function fireAlert({ tag, title, body, type = 'radar', cooldown = COOLDOWN_MS }) {
   const now = Date.now();
   const lastTime = State.alertCooldowns.get(tag) || 0;
-  if (now - lastTime < cooldown) return;  // still in cooldown
+  if (now - lastTime < cooldown) return;
   State.alertCooldowns.set(tag, now);
 
-  if (Notification.permission === 'granted') {
-    // Browser notification (works even when app is in background on Android)
+  if (NOTIF_SUPPORTED && Notification.permission === 'granted') {
     const n = new Notification(title, {
       body,
       icon: '/icons/radar.png',
@@ -477,7 +483,6 @@ function fireAlert({ tag, title, body, type = 'radar', cooldown = COOLDOWN_MS })
     });
     setTimeout(() => n.close(), 8000);
   } else {
-    // In-app alert banner
     showInAppAlert(title, body, type);
   }
 }
