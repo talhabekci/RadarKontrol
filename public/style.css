@@ -111,7 +111,7 @@ select { font-family: inherit; }
   border-right: 1px solid var(--glass-border);
   z-index: 100;
   transition: transform var(--transition), min-width var(--transition), width var(--transition);
-  overflow: hidden;
+  overflow: hidden;  /* desktop only — overridden on mobile */
 }
 
 .sidebar.collapsed {
@@ -820,6 +820,17 @@ select { font-family: inherit; }
 @media (max-width: 768px) {
   .app-container { flex-direction: column; }
 
+  /* Backdrop — blocks Leaflet map touch events behind open sidebar */
+  .mobile-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 599;  /* just below sidebar z-index: 600 */
+    background: rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+  }
+
   .sidebar {
     position: fixed;
     top: 0; left: 0; right: 0;
@@ -832,6 +843,7 @@ select { font-family: inherit; }
     transition: transform 0.35s cubic-bezier(.4,0,.2,1);
     z-index: 600;
     border-radius: 0 0 20px 20px;
+    overflow: visible;  /* allow native select pickers to render above */
   }
 
   .sidebar.mobile-hidden {
@@ -855,6 +867,14 @@ select { font-family: inherit; }
     padding: 16px;
     max-height: calc(75dvh - 65px);
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;  /* smooth iOS scrolling */
+    overscroll-behavior: contain;
+  }
+
+  /* Prevent map touch bleed-through on selects */
+  .select-input {
+    touch-action: manipulation;
+    font-size: 16px; /* prevents iOS auto-zoom on focus */
   }
 
   .update-banner {

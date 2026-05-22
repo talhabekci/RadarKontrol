@@ -119,6 +119,7 @@ const els = {
   sidebar:         $('sidebar'),
   sidebarToggle:   $('sidebar-toggle'),
   mobilePanelBtn:  $('mobile-panel-btn'),
+  backdrop:        $('mobile-backdrop'),
   // --- Location tracking ---
   locationToggle:  $('location-toggle'),
   trackingStatus:  $('tracking-status'),
@@ -776,6 +777,7 @@ async function createRoute() {
     // On mobile, hide sidebar after route
     if (window.innerWidth <= 768) {
       els.sidebar.classList.add('mobile-hidden');
+      els.backdrop.classList.add('hidden');
     }
 
   } catch (err) {
@@ -909,7 +911,17 @@ els.sidebarToggle.addEventListener('click', () => {
 
 // Mobile panel button
 els.mobilePanelBtn.addEventListener('click', () => {
-  els.sidebar.classList.toggle('mobile-hidden');
+  const isHidden = els.sidebar.classList.toggle('mobile-hidden');
+  // Show/hide backdrop
+  if (window.innerWidth <= 768) {
+    els.backdrop.classList.toggle('hidden', isHidden);
+  }
+});
+
+// Backdrop click — close sidebar
+els.backdrop.addEventListener('click', () => {
+  els.sidebar.classList.add('mobile-hidden');
+  els.backdrop.classList.add('hidden');
 });
 
 // Update banner — refresh
