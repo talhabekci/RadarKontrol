@@ -226,7 +226,29 @@
         </div>
         <p>Rota hesaplanıyor…</p>
       </div>
+
+      <!-- Speed HUD — top-right corner -->
+      <div class="speed-hud hidden" id="speed-hud">
+        <div class="speed-main">
+          <span class="speed-value" id="speed-value">--</span>
+          <span class="speed-unit">km/h</span>
+        </div>
+        <div class="speed-corridor hidden" id="speed-corridor">
+          <div class="speed-divider"></div>
+          <div class="req-row">
+            <span class="req-label">Gereken</span>
+            <span class="req-value" id="req-value">--</span>
+            <span class="req-unit">km/h</span>
+          </div>
+          <div class="corridor-progress-wrap">
+            <div class="corridor-progress-bar" id="corridor-progress-bar"></div>
+          </div>
+          <div class="corridor-hud-name" id="corridor-hud-name"></div>
+        </div>
+      </div>
+
     </main>
+
 
   </div><!-- /app-container -->
 

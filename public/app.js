@@ -8,22 +8,24 @@
    STATE
    ===================================================== */
 const State = {
-  cities: [],                  // [{Id, Name}]
-  fromDistricts: [],           // [{Id, Name, Latitude, Longitude}]
+  cities: [],
+  fromDistricts: [],
   toDistricts: [],
-  fromDistrict: null,          // selected district object
+  fromDistrict: null,
   toDistrict: null,
-  routeData: null,             // last API response data
+  routeData: null,
   lastFetchTime: null,
   updateTimer: null,
-  pendingUpdate: null,         // new routeData awaiting user confirm
+  pendingUpdate: null,
   isLoading: false,
   // --- Location tracking ---
-  watchId: null,               // geolocation watchPosition ID
-  userPosition: null,          // {lat, lon}
-  userMarker: null,            // Leaflet marker
-  alertCooldowns: new Map(),   // tag → timestamp (ms)
-  activeCorridors: new Set(),  // corridor IDs currently inside
+  watchId: null,
+  userPosition: null,
+  userMarker: null,
+  alertCooldowns: new Map(),
+  activeCorridors: new Set(),
+  // --- Corridor progress (average speed tracking) ---
+  corridorProgress: new Map(), // corridorId → {entryTime, distanceKm, lastLat, lastLon}
 };
 
 /* =====================================================
@@ -128,6 +130,13 @@ const els = {
   proximityAlerts: $('proximity-alerts'),
   notifBadge:      $('notif-badge'),
   notifBadgeIcon:  $('notif-badge-icon'),
+  // --- Speed HUD ---
+  speedHud:        $('speed-hud'),
+  speedValue:      $('speed-value'),
+  speedCorridor:   $('speed-corridor'),
+  reqValue:        $('req-value'),
+  corridorProgBar: $('corridor-progress-bar'),
+  corridorHudName: $('corridor-hud-name'),
 };
 
 /* =====================================================
@@ -554,9 +563,11 @@ function updateProximityPanel(nearbyItems) {
 
 /* =====================================================
    PROXIMITY CHECKER — called on every GPS update
+   Returns a Set of corridor IDs we're currently inside.
    ===================================================== */
-function checkProximity(lat, lon) {
-  if (!State.routeData) return;
+function checkProximityWithIds(lat, lon) {
+  const activeIds = new Set();
+  if (!State.routeData) return activeIds;
 
   const { SpeedTunnels = [], Radars = [] } = State.routeData;
   const nearbyItems = [];
@@ -564,88 +575,201 @@ function checkProximity(lat, lon) {
   // ---- 1. Speed corridors ----
   SpeedTunnels.forEach((tunnel) => {
     const dist = distanceToCorridor(lat, lon, tunnel);
-    const tag = `corridor-${tunnel.id}`;
+    const tag  = `corridor-${tunnel.id}`;
     const name = (tunnel.name || '').trim();
     const wasInside = State.activeCorridors.has(tunnel.id);
 
     if (dist <= CORRIDOR_ENTER_M) {
-      // Entering or already inside
-      nearbyItems.push({
-        icon: '⚡',
-        text: `${name} · ${tunnel.speedLimit} km/h`,
-        dist,
-        type: 'corridor',
-        active: true,
-      });
+      activeIds.add(tunnel.id);
+      nearbyItems.push({ icon: '⚡', text: `${name} · ${tunnel.speedLimit} km/h`, dist, type: 'corridor', active: true });
 
       if (!wasInside) {
-        // Just entered
         State.activeCorridors.add(tunnel.id);
-        fireAlert({
-          tag,
-          title: '⚡ Hız Koridoruna Girdiniz!',
-          body: `${name} — Limit: ${tunnel.speedLimit} km/h`,
-          type: 'corridor',
-          cooldown: COOLDOWN_MS,
-        });
+        fireAlert({ tag, title: '⚡ Hız Koridoruna Girdiniz!', body: `${name} — Limit: ${tunnel.speedLimit} km/h`, type: 'corridor', cooldown: COOLDOWN_MS });
       }
     } else if (dist <= RADAR_WARN_M) {
-      // Approaching (within 500m but not inside)
-      nearbyItems.push({
-        icon: '⚡',
-        text: `${name} · ${tunnel.speedLimit} km/h`,
-        dist,
-        type: 'corridor',
-        active: false,
-      });
+      nearbyItems.push({ icon: '⚡', text: `${name} · ${tunnel.speedLimit} km/h`, dist, type: 'corridor', active: false });
 
       if (!wasInside) {
-        fireAlert({
-          tag: `${tag}-approach`,
-          title: '⚠️ Hız Koridoru Yaklaşıyor',
-          body: `${Math.round(dist)} m uzakta · ${name} · ${tunnel.speedLimit} km/h`,
-          type: 'corridor',
-          cooldown: COOLDOWN_MS,
-        });
+        fireAlert({ tag: `${tag}-approach`, title: '⚠️ Hız Koridoru Yaklaşıyor', body: `${Math.round(dist)} m uzakta · ${name} · ${tunnel.speedLimit} km/h`, type: 'corridor', cooldown: COOLDOWN_MS });
       }
     } else if (wasInside && dist > CORRIDOR_EXIT_M) {
-      // Exited
       State.activeCorridors.delete(tunnel.id);
     }
   });
 
-  // ---- 2. Radars (when API returns them) ----
+  // ---- 2. Radars ----
   Radars.forEach((radar) => {
     if (!radar.Latitude || !radar.Longitude) return;
     const dist = haversineDistance(lat, lon, radar.Latitude, radar.Longitude);
-    const tag = `radar-${radar.Id || radar.id}`;
+    const tag  = `radar-${radar.Id || radar.id}`;
 
     if (dist <= RADAR_WARN_M) {
-      nearbyItems.push({
-        icon: '📷',
-        text: `Radar · ${radar.ProvinceName || ''} ${radar.DistrictName || ''}`.trim(),
-        dist,
-        type: 'radar',
-        active: dist <= 100,
-      });
-
-      fireAlert({
-        tag,
-        title: '📷 Radar Var!',
-        body: `${Math.round(dist)} m uzakta${radar.SpeedLimit ? ' · Limit: ' + radar.SpeedLimit + ' km/h' : ''}`,
-        type: 'radar',
-        cooldown: COOLDOWN_MS,
-      });
+      nearbyItems.push({ icon: '📷', text: `Radar · ${radar.ProvinceName || ''} ${radar.DistrictName || ''}`.trim(), dist, type: 'radar', active: dist <= 100 });
+      fireAlert({ tag, title: '📷 Radar Var!', body: `${Math.round(dist)} m uzakta${radar.SpeedLimit ? ' · Limit: ' + radar.SpeedLimit + ' km/h' : ''}`, type: 'radar', cooldown: COOLDOWN_MS });
     }
   });
 
-  // Sort: active corridors first, then by distance
-  nearbyItems.sort((a, b) => {
-    if (a.active !== b.active) return a.active ? -1 : 1;
-    return a.dist - b.dist;
+  nearbyItems.sort((a, b) => (a.active !== b.active ? (a.active ? -1 : 1) : a.dist - b.dist));
+  updateProximityPanel(nearbyItems);
+
+  return activeIds;
+}
+
+// Alias for the auto-update path (no return value needed)
+function checkProximity(lat, lon) { checkProximityWithIds(lat, lon); }
+
+/**
+ * From the active corridor IDs, find the one where the driver
+ * needs the highest speed to stay legal — most critical first.
+ */
+function getMostCriticalCorridor(activeIds) {
+  if (!State.routeData || activeIds.size === 0) return null;
+  const { SpeedTunnels = [] } = State.routeData;
+
+  let worst = null;
+  let worstReqSpeed = -Infinity;
+
+  activeIds.forEach((id) => {
+    const tunnel = SpeedTunnels.find((t) => t.id === id);
+    if (!tunnel) return;
+
+    const prog = State.corridorProgress.get(id);
+    if (!prog) { worst = worst || tunnel; return; }
+
+    const corridorLenKm   = tunnel.length;
+    const distTraveledKm  = Math.min(prog.distanceKm, corridorLenKm);
+    const remainingKm     = Math.max(0, corridorLenKm - distTraveledKm);
+    const totalTimeHr     = corridorLenKm / tunnel.speedLimit;
+    const elapsedTimeHr   = (Date.now() - prog.entryTime) / 3_600_000;
+    const remainingTimeHr = totalTimeHr - elapsedTimeHr;
+    const reqSpeed        = remainingTimeHr > 0 ? remainingKm / remainingTimeHr : Infinity;
+
+    if (reqSpeed > worstReqSpeed) {
+      worstReqSpeed = reqSpeed;
+      worst = tunnel;
+    }
   });
 
-  updateProximityPanel(nearbyItems);
+  return worst;
+}
+
+
+
+/* =====================================================
+   SPEED HUD
+   ===================================================== */
+
+/**
+ * Update the speed HUD with current GPS speed.
+ * speedMs: m/s from GPS (can be null).
+ * activeTunnel: the most critical corridor we’re inside (or null).
+ */
+function updateSpeedHUD(speedMs, activeTunnel) {
+  const speedKmh = (speedMs != null && speedMs >= 0)
+    ? Math.round(speedMs * 3.6)
+    : null;
+
+  // Show/hide HUD
+  els.speedHud.classList.toggle('hidden', speedKmh === null);
+  if (speedKmh === null) return;
+
+  // Current speed display
+  els.speedValue.textContent = speedKmh;
+
+  // Color based on active corridor limit
+  els.speedValue.className = 'speed-value';
+  if (activeTunnel) {
+    const limit = activeTunnel.speedLimit;
+    if (speedKmh <= limit)            els.speedValue.classList.add('speed-ok');
+    else if (speedKmh <= limit * 1.1) els.speedValue.classList.add('speed-warn');
+    else                               els.speedValue.classList.add('speed-danger');
+  }
+
+  // Corridor required speed panel
+  if (!activeTunnel) {
+    els.speedCorridor.classList.add('hidden');
+    return;
+  }
+
+  els.speedCorridor.classList.remove('hidden');
+
+  const prog = State.corridorProgress.get(activeTunnel.id);
+  if (!prog) return;
+
+  const corridorLenKm   = activeTunnel.length;              // total length (km)
+  const distTraveledKm  = Math.min(prog.distanceKm, corridorLenKm);
+  const remainingKm     = Math.max(0, corridorLenKm - distTraveledKm);
+  const totalTimeHr     = corridorLenKm / activeTunnel.speedLimit;  // min time to pass legally
+  const elapsedTimeHr   = (Date.now() - prog.entryTime) / 3_600_000;
+  const remainingTimeHr = totalTimeHr - elapsedTimeHr;
+
+  // Progress bar
+  const pct = Math.min(100, (distTraveledKm / corridorLenKm) * 100);
+  els.corridorProgBar.style.width = pct + '%';
+
+  // Corridor name
+  const name = (activeTunnel.name || '').trim();
+  els.corridorHudName.textContent = name || '';
+
+  // Required speed
+  els.reqValue.className = 'req-value';
+  if (remainingTimeHr <= 0 || remainingKm <= 0) {
+    // Already through or overtime
+    els.reqValue.textContent = '✔';
+    els.reqValue.classList.add('req-ok');
+    return;
+  }
+
+  const reqSpeed = Math.round(remainingKm / remainingTimeHr);
+
+  if (reqSpeed <= 0 || !isFinite(reqSpeed)) {
+    els.reqValue.textContent = '--';
+    return;
+  }
+
+  els.reqValue.textContent = reqSpeed;
+
+  if      (reqSpeed <= activeTunnel.speedLimit * 0.9)  els.reqValue.classList.add('req-ok');
+  else if (reqSpeed <= activeTunnel.speedLimit)         els.reqValue.classList.add('req-caution');
+  else if (reqSpeed <= activeTunnel.speedLimit * 1.15)  els.reqValue.classList.add('req-danger');
+  else {
+    // Impossible to compensate — already over average
+    els.reqValue.textContent = '⚠ Limit aşıldı';
+    els.reqValue.classList.add('req-over');
+  }
+}
+
+/**
+ * Track distance traveled inside each active corridor.
+ * Called on every GPS update.
+ */
+function updateCorridorProgress(lat, lon, activeCorridorIds) {
+  activeCorridorIds.forEach((id) => {
+    if (!State.corridorProgress.has(id)) {
+      // First time we see this corridor — initialise tracker
+      State.corridorProgress.set(id, {
+        entryTime: Date.now(),
+        distanceKm: 0,
+        lastLat: lat,
+        lastLon: lon,
+      });
+    } else {
+      const prog = State.corridorProgress.get(id);
+      const segKm = haversineDistance(lat, lon, prog.lastLat, prog.lastLon) / 1000;
+      // Sanity check: ignore jumps > 1 km (GPS glitch)
+      if (segKm < 1) prog.distanceKm += segKm;
+      prog.lastLat = lat;
+      prog.lastLon = lon;
+    }
+  });
+
+  // Clean up corridors we've left
+  for (const id of State.corridorProgress.keys()) {
+    if (!activeCorridorIds.has(id) && !State.activeCorridors.has(id)) {
+      State.corridorProgress.delete(id);
+    }
+  }
 }
 
 /* =====================================================
@@ -665,7 +789,7 @@ function startTracking() {
   State.watchId = navigator.geolocation.watchPosition(
     // Success
     (pos) => {
-      const { latitude: lat, longitude: lon, accuracy } = pos.coords;
+      const { latitude: lat, longitude: lon, speed } = pos.coords;
       State.userPosition = { lat, lon };
 
       // Update marker
@@ -676,8 +800,17 @@ function startTracking() {
       els.statusText.textContent =
         `Takip aktif · ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
 
-      // Check proximity
-      checkProximity(lat, lon);
+      // Check proximity — returns active corridor IDs
+      const activeIds = checkProximityWithIds(lat, lon);
+
+      // Update corridor progress tracking
+      updateCorridorProgress(lat, lon, activeIds);
+
+      // Find most critical active corridor for HUD
+      const activeTunnel = getMostCriticalCorridor(activeIds);
+
+      // Update speed HUD
+      updateSpeedHUD(speed, activeTunnel);
     },
     // Error
     (err) => {
@@ -705,6 +838,7 @@ function stopTracking() {
   State.userPosition = null;
   State.activeCorridors.clear();
   State.alertCooldowns.clear();
+  State.corridorProgress.clear();
 
   // Remove user marker
   layers.user.clearLayers();
@@ -715,6 +849,7 @@ function stopTracking() {
   els.proximityAlerts.innerHTML = '';
   els.statusDot.className = 'status-dot';
   els.statusText.textContent = 'Konum alınıyor…';
+  els.speedHud.classList.add('hidden');
 }
 
 /* =====================================================
@@ -767,6 +902,8 @@ async function createRoute() {
     // Reset corridor tracking on new route
     State.activeCorridors.clear();
     State.alertCooldowns.clear();
+    State.corridorProgress.clear();
+
 
     renderMap(result.data);
     renderStats(result.data);
