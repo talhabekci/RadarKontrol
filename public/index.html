@@ -149,6 +149,31 @@
           </div>
         </div>
 
+        <!-- Location Tracking Card -->
+        <div class="tracking-card" id="tracking-card">
+          <div class="tracking-header">
+            <div class="tracking-title-row">
+              <span class="tracking-icon">📍</span>
+              <span class="tracking-title">Konum Takibi</span>
+              <div class="notif-badge" id="notif-badge" title="Bildirim izin durumu">
+                <span id="notif-badge-icon">🔔</span>
+              </div>
+            </div>
+            <label class="toggle-switch" aria-label="Konumu takip et">
+              <input type="checkbox" id="location-toggle">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <p class="tracking-desc" id="tracking-desc">Aktif edildiğinde konumunuz haritada gösterilir ve radar/koridora yaklaşınca bildirim alırsınız.</p>
+          <div class="tracking-status hidden" id="tracking-status">
+            <div class="tracking-status-row">
+              <span class="status-dot" id="status-dot"></span>
+              <span id="status-text">Konum alınıyor…</span>
+            </div>
+            <div class="proximity-alerts" id="proximity-alerts"></div>
+          </div>
+        </div>
+
         <!-- Legend -->
         <div class="legend">
           <div class="legend-title">Harita Göstergeleri</div>
@@ -164,6 +189,10 @@
             <div class="legend-item">
               <div class="legend-icon radar-legend-icon"></div>
               <span>Radar / Kontrol Noktası</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-dot user-dot"></div>
+              <span>Konumunuz</span>
             </div>
           </div>
         </div>

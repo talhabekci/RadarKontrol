@@ -18,6 +18,12 @@ const State = {
   updateTimer: null,
   pendingUpdate: null,         // new routeData awaiting user confirm
   isLoading: false,
+  // --- Location tracking ---
+  watchId: null,               // geolocation watchPosition ID
+  userPosition: null,          // {lat, lon}
+  userMarker: null,            // Leaflet marker
+  alertCooldowns: new Map(),   // tag → timestamp (ms)
+  activeCorridors: new Set(),  // corridor IDs currently inside
 };
 
 /* =====================================================
@@ -39,6 +45,7 @@ const layers = {
   route: L.layerGroup().addTo(map),
   corridors: L.layerGroup().addTo(map),
   markers: L.layerGroup().addTo(map),
+  user: L.layerGroup().addTo(map),  // user location (always on top)
 };
 
 // Radar marker icon
@@ -90,28 +97,36 @@ const API = {
 const $ = (id) => document.getElementById(id);
 
 const els = {
-  fromCity:       $('from-city'),
-  fromDistrict:   $('from-district'),
-  toCity:         $('to-city'),
-  toDistrict:     $('to-district'),
-  routeBtn:       $('route-btn'),
-  btnLabel:       document.querySelector('.btn-label'),
-  btnSpinner:     document.querySelector('.btn-spinner'),
-  statsPanel:     $('stats-panel'),
-  statsRouteName: $('stats-route-name'),
-  statRadars:     $('stat-radars'),
-  statCheckpoints:$('stat-checkpoints'),
-  statCorridors:  $('stat-corridors'),
-  cityList:       $('city-list'),
-  lastUpdated:    $('last-updated'),
-  mapLoading:     $('map-loading'),
-  updateBanner:   $('update-banner'),
-  updateText:     $('update-text'),
-  updateRefresh:  $('update-refresh-btn'),
-  updateDismiss:  $('update-dismiss-btn'),
-  sidebar:        $('sidebar'),
-  sidebarToggle:  $('sidebar-toggle'),
-  mobilePanelBtn: $('mobile-panel-btn'),
+  fromCity:        $('from-city'),
+  fromDistrict:    $('from-district'),
+  toCity:          $('to-city'),
+  toDistrict:      $('to-district'),
+  routeBtn:        $('route-btn'),
+  btnLabel:        document.querySelector('.btn-label'),
+  btnSpinner:      document.querySelector('.btn-spinner'),
+  statsPanel:      $('stats-panel'),
+  statsRouteName:  $('stats-route-name'),
+  statRadars:      $('stat-radars'),
+  statCheckpoints: $('stat-checkpoints'),
+  statCorridors:   $('stat-corridors'),
+  cityList:        $('city-list'),
+  lastUpdated:     $('last-updated'),
+  mapLoading:      $('map-loading'),
+  updateBanner:    $('update-banner'),
+  updateText:      $('update-text'),
+  updateRefresh:   $('update-refresh-btn'),
+  updateDismiss:   $('update-dismiss-btn'),
+  sidebar:         $('sidebar'),
+  sidebarToggle:   $('sidebar-toggle'),
+  mobilePanelBtn:  $('mobile-panel-btn'),
+  // --- Location tracking ---
+  locationToggle:  $('location-toggle'),
+  trackingStatus:  $('tracking-status'),
+  statusDot:       $('status-dot'),
+  statusText:      $('status-text'),
+  proximityAlerts: $('proximity-alerts'),
+  notifBadge:      $('notif-badge'),
+  notifBadgeIcon:  $('notif-badge-icon'),
 };
 
 /* =====================================================
@@ -319,9 +334,6 @@ function buildRadarPopup(radar) {
     </div>`;
 }
 
-/* =====================================================
-   CORRIDOR MARKER CSS (injected)
-   ===================================================== */
 const corridorStyle = document.createElement('style');
 corridorStyle.textContent = `
   .corridor-marker {
@@ -345,6 +357,359 @@ corridorStyle.textContent = `
   }
 `;
 document.head.appendChild(corridorStyle);
+
+/* =====================================================
+   DISTANCE MATH
+   ===================================================== */
+
+/**
+ * Haversine formula — returns distance in metres between two lat/lon points.
+ */
+function haversineDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/**
+ * Minimum distance (metres) from a point to a line segment (A→B).
+ * All inputs are lat/lon.
+ */
+function pointToSegmentDist(pLat, pLon, aLat, aLon, bLat, bLon) {
+  const dx = bLon - aLon;
+  const dy = bLat - aLat;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return haversineDistance(pLat, pLon, aLat, aLon);
+  const t = Math.max(0, Math.min(1, ((pLon - aLon) * dx + (pLat - aLat) * dy) / lenSq));
+  return haversineDistance(pLat, pLon, aLat + t * dy, aLon + t * dx);
+}
+
+/**
+ * Minimum distance (metres) from user position to an entire corridor polyline.
+ * Uses a bounding-box pre-filter for performance.
+ */
+function distanceToCorridor(userLat, userLon, corridor) {
+  const coords = corridor.coordinates;
+  if (!coords || coords.length === 0) return Infinity;
+
+  // Bounding box pre-filter (~10 km margin)
+  const MARGIN = 0.09;
+  const lats = coords.map((c) => c.y);
+  const lons = coords.map((c) => c.x);
+  const minLat = Math.min(...lats) - MARGIN;
+  const maxLat = Math.max(...lats) + MARGIN;
+  const minLon = Math.min(...lons) - MARGIN;
+  const maxLon = Math.max(...lons) + MARGIN;
+
+  if (userLat < minLat || userLat > maxLat || userLon < minLon || userLon > maxLon) {
+    return Infinity;
+  }
+
+  let minDist = Infinity;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const d = pointToSegmentDist(
+      userLat, userLon,
+      coords[i].y, coords[i].x,
+      coords[i + 1].y, coords[i + 1].x
+    );
+    if (d < minDist) minDist = d;
+    // Early exit if already very close
+    if (minDist < 20) break;
+  }
+  return minDist;
+}
+
+/* =====================================================
+   NOTIFICATION MODULE
+   ===================================================== */
+const COOLDOWN_MS       = 5 * 60 * 1000;  // 5 dakika — aynı uyarı tekrar etmez
+const RADAR_WARN_M      = 500;             // metre — radara bu kadar yaklaşınca uyar
+const CORRIDOR_ENTER_M  = 80;              // metre — koridora bu kadar yakınınca uyar
+const CORRIDOR_EXIT_M   = 200;             // koridordan bu kadar uzaklaşınca çıktı say
+
+function updateNotifBadge() {
+  const perm = Notification.permission;
+  els.notifBadge.className = 'notif-badge ' + perm;
+  if (perm === 'granted') {
+    els.notifBadgeIcon.textContent = '🔔';
+    els.notifBadge.title = 'Bildirimler açık';
+  } else if (perm === 'denied') {
+    els.notifBadgeIcon.textContent = '🔕';
+    els.notifBadge.title = 'Bildirimler kapalı — ekran uyarısı kullanılıyor';
+  } else {
+    els.notifBadgeIcon.textContent = '🔔';
+    els.notifBadge.title = 'Bildirim izni bekleniyor';
+  }
+}
+
+async function requestNotificationPermission() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default') {
+    await Notification.requestPermission();
+  }
+  updateNotifBadge();
+}
+
+/**
+ * Fire a browser notification or show an in-app alert banner.
+ * tag: unique string — prevents duplicate notifications.
+ * cooldown: ms to wait before re-alerting with same tag.
+ */
+function fireAlert({ tag, title, body, type = 'radar', cooldown = COOLDOWN_MS }) {
+  const now = Date.now();
+  const lastTime = State.alertCooldowns.get(tag) || 0;
+  if (now - lastTime < cooldown) return;  // still in cooldown
+  State.alertCooldowns.set(tag, now);
+
+  if (Notification.permission === 'granted') {
+    // Browser notification (works even when app is in background on Android)
+    const n = new Notification(title, {
+      body,
+      icon: '/icons/radar.png',
+      tag,
+      vibrate: [200, 100, 200],
+      requireInteraction: false,
+    });
+    setTimeout(() => n.close(), 8000);
+  } else {
+    // In-app alert banner
+    showInAppAlert(title, body, type);
+  }
+}
+
+let _inAppAlertTimer = null;
+function showInAppAlert(title, body, type = 'radar') {
+  // Remove existing alert if present
+  document.querySelector('.inapp-alert')?.remove();
+  if (_inAppAlertTimer) clearTimeout(_inAppAlertTimer);
+
+  const el = document.createElement('div');
+  el.className = `inapp-alert ${type === 'corridor' ? 'corridor-alert' : 'radar-alert'}`;
+  el.innerHTML = `
+    <div class="alert-icon">${type === 'corridor' ? '⚡' : '📷'}</div>
+    <div class="alert-body">
+      <div class="alert-title">${title}</div>
+      <div class="alert-sub">${body}</div>
+    </div>
+  `;
+  document.body.appendChild(el);
+  _inAppAlertTimer = setTimeout(() => el.remove(), 6000);
+}
+
+/* =====================================================
+   USER LOCATION MARKER
+   ===================================================== */
+const userLocationIcon = L.divIcon({
+  html: `<div class="user-location-marker">
+           <div class="user-location-ring"></div>
+           <div class="user-location-dot"></div>
+         </div>`,
+  className: '',
+  iconSize: [40, 40],
+  iconAnchor: [20, 20],
+});
+
+function updateUserMarker(lat, lon) {
+  if (State.userMarker) {
+    State.userMarker.setLatLng([lat, lon]);
+  } else {
+    State.userMarker = L.marker([lat, lon], {
+      icon: userLocationIcon,
+      zIndexOffset: 1000,
+    }).addTo(layers.user);
+  }
+}
+
+/* =====================================================
+   PROXIMITY ALERTS PANEL (sidebar chips)
+   ===================================================== */
+function updateProximityPanel(nearbyItems) {
+  els.proximityAlerts.innerHTML = '';
+  if (nearbyItems.length === 0) return;
+
+  nearbyItems.forEach(({ icon, text, dist, type, active }) => {
+    const chip = document.createElement('div');
+    chip.className = `proximity-chip ${type}-chip${active ? ' active-corridor' : ''}`;
+    const distStr = dist < 1000
+      ? `${Math.round(dist)} m`
+      : `${(dist / 1000).toFixed(1)} km`;
+    chip.innerHTML = `
+      <span class="chip-icon">${icon}</span>
+      <span class="chip-text">${text}</span>
+      <span class="chip-dist">${active ? 'İÇİNDE' : distStr}</span>
+    `;
+    els.proximityAlerts.appendChild(chip);
+  });
+}
+
+/* =====================================================
+   PROXIMITY CHECKER — called on every GPS update
+   ===================================================== */
+function checkProximity(lat, lon) {
+  if (!State.routeData) return;
+
+  const { SpeedTunnels = [], Radars = [] } = State.routeData;
+  const nearbyItems = [];
+
+  // ---- 1. Speed corridors ----
+  SpeedTunnels.forEach((tunnel) => {
+    const dist = distanceToCorridor(lat, lon, tunnel);
+    const tag = `corridor-${tunnel.id}`;
+    const name = (tunnel.name || '').trim();
+    const wasInside = State.activeCorridors.has(tunnel.id);
+
+    if (dist <= CORRIDOR_ENTER_M) {
+      // Entering or already inside
+      nearbyItems.push({
+        icon: '⚡',
+        text: `${name} · ${tunnel.speedLimit} km/h`,
+        dist,
+        type: 'corridor',
+        active: true,
+      });
+
+      if (!wasInside) {
+        // Just entered
+        State.activeCorridors.add(tunnel.id);
+        fireAlert({
+          tag,
+          title: '⚡ Hız Koridoruna Girdiniz!',
+          body: `${name} — Limit: ${tunnel.speedLimit} km/h`,
+          type: 'corridor',
+          cooldown: COOLDOWN_MS,
+        });
+      }
+    } else if (dist <= RADAR_WARN_M) {
+      // Approaching (within 500m but not inside)
+      nearbyItems.push({
+        icon: '⚡',
+        text: `${name} · ${tunnel.speedLimit} km/h`,
+        dist,
+        type: 'corridor',
+        active: false,
+      });
+
+      if (!wasInside) {
+        fireAlert({
+          tag: `${tag}-approach`,
+          title: '⚠️ Hız Koridoru Yaklaşıyor',
+          body: `${Math.round(dist)} m uzakta · ${name} · ${tunnel.speedLimit} km/h`,
+          type: 'corridor',
+          cooldown: COOLDOWN_MS,
+        });
+      }
+    } else if (wasInside && dist > CORRIDOR_EXIT_M) {
+      // Exited
+      State.activeCorridors.delete(tunnel.id);
+    }
+  });
+
+  // ---- 2. Radars (when API returns them) ----
+  Radars.forEach((radar) => {
+    if (!radar.Latitude || !radar.Longitude) return;
+    const dist = haversineDistance(lat, lon, radar.Latitude, radar.Longitude);
+    const tag = `radar-${radar.Id || radar.id}`;
+
+    if (dist <= RADAR_WARN_M) {
+      nearbyItems.push({
+        icon: '📷',
+        text: `Radar · ${radar.ProvinceName || ''} ${radar.DistrictName || ''}`.trim(),
+        dist,
+        type: 'radar',
+        active: dist <= 100,
+      });
+
+      fireAlert({
+        tag,
+        title: '📷 Radar Var!',
+        body: `${Math.round(dist)} m uzakta${radar.SpeedLimit ? ' · Limit: ' + radar.SpeedLimit + ' km/h' : ''}`,
+        type: 'radar',
+        cooldown: COOLDOWN_MS,
+      });
+    }
+  });
+
+  // Sort: active corridors first, then by distance
+  nearbyItems.sort((a, b) => {
+    if (a.active !== b.active) return a.active ? -1 : 1;
+    return a.dist - b.dist;
+  });
+
+  updateProximityPanel(nearbyItems);
+}
+
+/* =====================================================
+   GEOLOCATION MODULE
+   ===================================================== */
+function startTracking() {
+  if (!navigator.geolocation) {
+    showToast('Tarayıcınız konum özelliğini desteklemiyor.', 'error');
+    els.locationToggle.checked = false;
+    return;
+  }
+
+  els.trackingStatus.classList.remove('hidden');
+  els.statusDot.className = 'status-dot';
+  els.statusText.textContent = 'Konum alınıyor…';
+
+  State.watchId = navigator.geolocation.watchPosition(
+    // Success
+    (pos) => {
+      const { latitude: lat, longitude: lon, accuracy } = pos.coords;
+      State.userPosition = { lat, lon };
+
+      // Update marker
+      updateUserMarker(lat, lon);
+
+      // Update status
+      els.statusDot.className = 'status-dot active';
+      els.statusText.textContent =
+        `Takip aktif · ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+
+      // Check proximity
+      checkProximity(lat, lon);
+    },
+    // Error
+    (err) => {
+      els.statusDot.className = 'status-dot error';
+      const msgs = {
+        1: 'Konum izni reddedildi.',
+        2: 'Konum alınamadı.',
+        3: 'Konum zaman aşımı.',
+      };
+      els.statusText.textContent = msgs[err.code] || 'Konum hatası.';
+    },
+    {
+      enableHighAccuracy: true,
+      maximumAge: 5000,
+      timeout: 15000,
+    }
+  );
+}
+
+function stopTracking() {
+  if (State.watchId !== null) {
+    navigator.geolocation.clearWatch(State.watchId);
+    State.watchId = null;
+  }
+  State.userPosition = null;
+  State.activeCorridors.clear();
+  State.alertCooldowns.clear();
+
+  // Remove user marker
+  layers.user.clearLayers();
+  State.userMarker = null;
+
+  // Reset UI
+  els.trackingStatus.classList.add('hidden');
+  els.proximityAlerts.innerHTML = '';
+  els.statusDot.className = 'status-dot';
+  els.statusText.textContent = 'Konum alınıyor…';
+}
 
 /* =====================================================
    AUTO-UPDATE (30 min)
@@ -383,6 +748,9 @@ async function createRoute() {
   setLoading(true);
   hideUpdateBanner();
 
+  // Request notification permission on first route creation
+  await requestNotificationPermission();
+
   try {
     const result = await API.createRoute(State.fromDistrict, State.toDistrict);
     if (!result.success) throw new Error(result.message || 'Bilinmeyen hata');
@@ -390,9 +758,17 @@ async function createRoute() {
     State.routeData = result.data;
     State.lastFetchTime = new Date();
     State.pendingUpdate = null;
+    // Reset corridor tracking on new route
+    State.activeCorridors.clear();
+    State.alertCooldowns.clear();
 
     renderMap(result.data);
     renderStats(result.data);
+
+    // Re-check proximity immediately with new route data
+    if (State.userPosition) {
+      checkProximity(State.userPosition.lat, State.userPosition.lon);
+    }
 
     // Auto-update
     startAutoUpdate();
@@ -553,7 +929,17 @@ els.updateRefresh.addEventListener('click', () => {
 // Update banner — dismiss
 els.updateDismiss.addEventListener('click', hideUpdateBanner);
 
+// Location tracking toggle
+els.locationToggle.addEventListener('change', () => {
+  if (els.locationToggle.checked) {
+    startTracking();
+  } else {
+    stopTracking();
+  }
+});
+
 /* =====================================================
    START
    ===================================================== */
+updateNotifBadge();
 init();
