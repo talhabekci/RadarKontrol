@@ -140,6 +140,67 @@ const els = {
 };
 
 /* =====================================================
+   SESSION PERSISTENCE
+   Survive background kills by writing state to sessionStorage.
+   ===================================================== */
+const STORAGE_KEY    = 'rk_state_v1';
+const STORAGE_MAX_MS = 2 * 60 * 60 * 1000; // 2 saat — daha eski kaydı yok say
+
+function persistState() {
+  if (!State.routeData) return;
+  try {
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify({
+      ts:               Date.now(),
+      routeData:        State.routeData,
+      fromDistrict:     State.fromDistrict,
+      toDistrict:       State.toDistrict,
+      corridorProgress: Array.from(State.corridorProgress.entries()),
+      activeCorridors:  Array.from(State.activeCorridors),
+      trackingWasOn:    els.locationToggle.checked,
+    }));
+  } catch (_) { /* storage full or unavailable */ }
+}
+
+function tryRestoreState() {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+
+    const saved = JSON.parse(raw);
+    if (Date.now() - saved.ts > STORAGE_MAX_MS) {
+      sessionStorage.removeItem(STORAGE_KEY);
+      return;
+    }
+
+    // Restore in-memory state
+    State.routeData     = saved.routeData;
+    State.fromDistrict  = saved.fromDistrict;
+    State.toDistrict    = saved.toDistrict;
+
+    // Corridor progress: entryTime is absolute timestamp — math stays correct
+    // Set lastLat/lastLon to null so the first GPS update doesn’t cause a jump
+    const restoredProgress = (saved.corridorProgress || []).map(([id, prog]) => [
+      id, { ...prog, lastLat: null, lastLon: null }
+    ]);
+    State.corridorProgress = new Map(restoredProgress);
+    State.activeCorridors  = new Set(saved.activeCorridors || []);
+
+    // Re-render map + stats without a new API call
+    renderMap(State.routeData);
+    renderStats(State.routeData);
+    startAutoUpdate();
+
+    // Re-enable tracking if it was on before background
+    if (saved.trackingWasOn) {
+      els.locationToggle.checked = true;
+      startTracking();
+    }
+
+    showToast('Önceki rota geri yüklendi ✅', 'info');
+  } catch (_) { /* corrupt storage — start fresh */ }
+}
+
+/* =====================================================
    INIT — Load cities
    ===================================================== */
 async function init() {
@@ -149,6 +210,9 @@ async function init() {
     populateCitySelect(els.toCity, State.cities);
     els.fromCity.disabled = false;
     els.toCity.disabled = false;
+
+    // Restore previous session state (if any)
+    tryRestoreState();
   } catch (err) {
     showToast('Şehirler yüklenirken hata oluştu: ' + err.message, 'error');
   }
@@ -749,15 +813,23 @@ function updateCorridorProgress(lat, lon, activeCorridorIds) {
     if (!State.corridorProgress.has(id)) {
       // First time we see this corridor — initialise tracker
       State.corridorProgress.set(id, {
-        entryTime: Date.now(),
+        entryTime:  Date.now(),
         distanceKm: 0,
-        lastLat: lat,
-        lastLon: lon,
+        lastLat:    lat,
+        lastLon:    lon,
       });
     } else {
       const prog = State.corridorProgress.get(id);
+
+      // lastLat is null when restored from background — just sync position, no distance added
+      if (prog.lastLat === null || prog.lastLon === null) {
+        prog.lastLat = lat;
+        prog.lastLon = lon;
+        return;
+      }
+
       const segKm = haversineDistance(lat, lon, prog.lastLat, prog.lastLon) / 1000;
-      // Sanity check: ignore jumps > 1 km (GPS glitch)
+      // Sanity check: ignore jumps > 1 km (GPS glitch or large background gap)
       if (segKm < 1) prog.distanceKm += segKm;
       prog.lastLat = lat;
       prog.lastLon = lon;
@@ -771,6 +843,7 @@ function updateCorridorProgress(lat, lon, activeCorridorIds) {
     }
   }
 }
+
 
 /* =====================================================
    GEOLOCATION MODULE
@@ -840,16 +913,17 @@ function stopTracking() {
   State.alertCooldowns.clear();
   State.corridorProgress.clear();
 
-  // Remove user marker
   layers.user.clearLayers();
   State.userMarker = null;
 
-  // Reset UI
   els.trackingStatus.classList.add('hidden');
   els.proximityAlerts.innerHTML = '';
   els.statusDot.className = 'status-dot';
   els.statusText.textContent = 'Konum alınıyor…';
   els.speedHud.classList.add('hidden');
+
+  // Update stored state so tracking doesn’t auto-restart on next load
+  persistState();
 }
 
 /* =====================================================
@@ -1097,3 +1171,20 @@ els.locationToggle.addEventListener('change', () => {
    ===================================================== */
 updateNotifBadge();
 init();
+
+// Persist state every 15 seconds
+setInterval(persistState, 15_000);
+
+// Persist when going to background; reset GPS positions when coming back
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    persistState();
+  } else {
+    // Coming back from background: null out lastLat/lastLon
+    // so the next GPS fix doesn’t create a phantom distance jump
+    State.corridorProgress.forEach((prog) => {
+      prog.lastLat = null;
+      prog.lastLon = null;
+    });
+  }
+});
